@@ -61,7 +61,9 @@ bool strendEXT(const char *string, const char *suffix) {
 }
 
 const char *src = "i32 foo(i32 x) {\n"
-                  "  return x * 5 + 42;\n"
+                  "  i32 y = x * 5;\n"
+                  "  y = y + 42;\n"
+                  "  return y;\n"
                   "}\n"
                   "i32 main() {\n"
                   "  return foo(13);\n"
@@ -97,7 +99,9 @@ int parse(const char *filename, const char *source, mpc_result_t *out_result) {
       " lexp      : <term> (('+' | '-') <term>)* ;                       \n"
       "                                                                  \n"
       " stmt      : \"return\" <lexp>? ';'                               \n"
-      "           | <ident> '(' <ident>? (',' <ident>)* ')' ';' ;        \n"
+      "           | <ident> '(' <ident>? (',' <ident>)* ')' ';'          \n"
+      "           | <typeident> ('=' <lexp>)? ';'                        \n"
+      "           | <ident> '=' <lexp> ';' ;                             \n"
       "                                                                  \n"
       " args      : <typeident>? (',' <typeident>)* ;                    \n"
       " body      : '{' <stmt>* '}' ;                                    \n"
@@ -158,6 +162,7 @@ struct ASTLowering {
       return lower_ident(ast, type);
     } else {
       AST_ASSERT(false, "unknown ast node detected");
+      return nullptr;
     }
   }
 
@@ -166,7 +171,13 @@ struct ASTLowering {
         nullptr != symbolTable[ast->contents],
         "expected ident AST node to be a valid symbol in the symbol table");
 
-    return symbolTable[ast->contents];
+    LLVMValueRef value = symbolTable[ast->contents];
+
+    if (LLVMIsAAllocaInst(value)) {
+      return LLVMBuildLoad(builder, value, "");
+    } else {
+      return value;
+    }
   }
 
   LLVMValueRef lower_factor(mpc_ast_t *const ast, LLVMTypeRef type) {
@@ -387,10 +398,83 @@ struct ASTLowering {
     if ((0 == strcmp("string", ast->children[0]->tag)) &&
         (0 == strcmp("return", ast->children[0]->contents))) {
       lower_return(ast);
-      return 0;
+    } else if (0 == strcmp("typeident|>", ast->children[0]->tag)) {
+      mpc_ast_t *const typeident = ast->children[0];
+      AST_ASSERT(2 == typeident->children_num,
+                 "expected type identifier to have two children");
+
+      AST_ASSERT_STREQ("type|regex", typeident->children[0]->tag,
+                       "expected type identifier's first child to be a type");
+
+      AST_ASSERT(nullptr != typeTable[typeident->children[0]->contents],
+                 "expected type to be in typeTable");
+
+      LLVMTypeRef type = typeTable[typeident->children[0]->contents];
+
+      AST_ASSERT_STREQ(
+          "ident|regex", typeident->children[1]->tag,
+          "expected type identifier's second child to be an identifier");
+
+      AST_ASSERT(
+          0 == symbolTable.count(typeident->children[1]->contents),
+          "inserting symbol into the symbol table failed because a symbol was "
+          "already present for the given symbol name");
+
+      // we need to create a function-local memory location for our variable.
+      // For this we'll use the stack (alloca!)
+      LLVMValueRef value =
+          LLVMBuildAlloca(builder, type, typeident->children[1]->contents);
+
+      symbolTable[typeident->children[1]->contents] = value;
+      symbolCleanup.push_back(typeident->children[1]->contents);
+
+      // if we have more than two children, our typeident has an initializer
+      if (2 < ast->children_num) {
+        AST_ASSERT_STREQ("char", ast->children[1]->tag,
+                         "expected the second child of the statement AST node "
+                         "to be a character");
+        AST_ASSERT_STREQ("=", ast->children[1]->contents,
+                         "expected the second child of the statement AST node "
+                         "to be the character '='");
+
+        LLVMValueRef initializer = lower_ast_node(ast->children[2], type);
+
+        LLVMBuildStore(builder, initializer, value);
+
+        AST_ASSERT_STREQ("char", ast->children[3]->tag,
+                         "expected the fourth child of the statement AST node "
+                         "to be a character");
+        AST_ASSERT_STREQ(";", ast->children[3]->contents,
+                         "expected the fourth child of the statement AST node "
+                         "to be the character ';'");
+      } else {
+        AST_ASSERT_STREQ("char", ast->children[1]->tag,
+                         "expected the second child of the statement AST node "
+                         "to be a character");
+        AST_ASSERT_STREQ(";", ast->children[1]->contents,
+                         "expected the second child of the statement AST node "
+                         "to be the character ';'");
+      }
+    } else if ((0 == strcmp("ident|regex", ast->children[0]->tag)) &&
+               (0 == strcmp("char", ast->children[1]->tag)) &&
+               (0 == strcmp("=", ast->children[1]->contents))) {
+      // we are assigning a new value to an identifier!
+      AST_ASSERT(nullptr != symbolTable[ast->children[0]->contents],
+                 "expected identifier to have an existing symbol in the symbol "
+                 "table!");
+      LLVMValueRef lhs = symbolTable[ast->children[0]->contents];
+
+      AST_ASSERT(nullptr != LLVMIsAAllocaInst(lhs),
+                 "expected symbol we are storing to to be an alloca");
+      LLVMValueRef rhs =
+          lower_ast_node(ast->children[2], LLVMGetElementType(LLVMTypeOf(lhs)));
+
+      LLVMBuildStore(builder, rhs, lhs);
     } else {
       AST_ASSERT(false, "unknown statement AST node");
     }
+
+    return 0;
   }
 
   int lower_function_body(mpc_ast_t *const ast) {
@@ -400,7 +484,7 @@ struct ASTLowering {
 
     AST_ASSERT(
         3 <= ast->children_num,
-        "expecte function body AST node to have at least three children");
+        "expected function body AST node to have at least three children");
 
     AST_ASSERT_STREQ(
         "char", ast->children[0]->tag,
@@ -533,15 +617,19 @@ struct ASTLowering {
                  "function's parameter has the same name as an existing "
                  "tracked symbol");
       symbolTable[paramNames[i]] = params[i];
+      symbolCleanup.push_back(paramNames[i]);
     }
 
     const int result = lower_function_body(body);
 
-    // remove our parameter name symbols from the symbol table as they are no
-    // longer valid symbols
-    for (unsigned i = 0; i < numParameters; i++) {
-      symbolTable.erase(paramNames[i]);
+    // remove any symbols that are local to the function. This includes
+    // parameters to the function, and identifiers declared in the body of the
+    // function.
+    for (auto symbol : symbolCleanup) {
+      symbolTable.erase(symbol);
     }
+
+    symbolCleanup.clear();
 
     return result;
   }
@@ -574,6 +662,7 @@ private:
   LLVMValueRef function;
   NeilMap<LLVMTypeRef> typeTable;
   NeilMap<LLVMValueRef> symbolTable;
+  NeilVector<const char *> symbolCleanup;
 };
 
 int mpc2llvm(const char *filename, mpc_ast_t *ast) {
