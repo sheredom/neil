@@ -1,0 +1,8 @@
+[submodule "external/llvm"]
+	path = external/llvm
+	url = http://llvm.org/git/llvm.git
+	branch = release_39
+[submodule "external/mpc"]
+	path = external/mpc
+	url = git@github.com:orangeduck/mpc.git
+	branch = master

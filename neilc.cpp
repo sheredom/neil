@@ -32,7 +32,7 @@
 #include <llvm-c/Core.h>
 
 extern "C" {
-#include <mpc/mpc.h>
+#include <mpc.h>
 }
 
 #define AST_ASSERT(cond, message) assert(cond &&message)
@@ -62,6 +62,7 @@ bool strendEXT(const char *string, const char *suffix) {
 
 const char *src = "i32 foo(i32 x) {\n"
                   "  i32 y = x * 5;\n"
+                  "  if (y < 4) { i32 z = x; y = z; }\n"
                   "  y = y + 42;\n"
                   "  return y;\n"
                   "}\n"
@@ -75,6 +76,7 @@ int parse(const char *filename, const char *source, mpc_result_t *out_result) {
   mpc_parser_t *Factor = mpc_new("factor");
   mpc_parser_t *Term = mpc_new("term");
   mpc_parser_t *Lexp = mpc_new("lexp");
+  mpc_parser_t *Bexp = mpc_new("bexp");
   mpc_parser_t *Stmt = mpc_new("stmt");
   mpc_parser_t *Type = mpc_new("type");
   mpc_parser_t *Typeident = mpc_new("typeident");
@@ -85,30 +87,34 @@ int parse(const char *filename, const char *source, mpc_result_t *out_result) {
 
   mpc_err_t *err = mpca_lang(
       MPCA_LANG_DEFAULT,
-      " ident     : /[a-zA-Z_][a-zA-Z0-9_]*/ ;                           \n"
-      " literal   : /[0-9]+(\\.[0-9]+)?((e|E)(-|\\+)?[0-9]+)?/ ;         \n"
-      "                                                                  \n"
-      " type      : (\"i1\" | /(i|u)(8|16|32|64)/ | /f(16|32|64)/) ;     \n"
-      " typeident : <type> <ident> ;                                     \n"
-      "                                                                  \n"
-      " factor    : <literal>                                            \n"
-      "           | <ident> '(' <lexp>? (',' <lexp>)* ')'                \n"
-      "           | <ident> ;                                            \n"
-      "                                                                  \n"
-      " term      : <factor> (('*' | '/' | '%') <factor>)* ;             \n"
-      " lexp      : <term> (('+' | '-') <term>)* ;                       \n"
-      "                                                                  \n"
-      " stmt      : \"return\" <lexp>? ';'                               \n"
-      "           | <ident> '(' <ident>? (',' <ident>)* ')' ';'          \n"
-      "           | <typeident> ('=' <lexp>)? ';'                        \n"
-      "           | <ident> '=' <lexp> ';' ;                             \n"
-      "                                                                  \n"
-      " args      : <typeident>? (',' <typeident>)* ;                    \n"
-      " body      : '{' <stmt>* '}' ;                                    \n"
-      " procedure : <type> <ident> '(' <args> ')' <body> ;               \n"
-      " lang      : /^/ ((<typeident> ';') |  <procedure>)* /$/ ;        \n",
-      Ident, Number, Factor, Term, Lexp, Stmt, Typeident, Type, Args, Body,
-      Procedure, Lang, NULL);
+      " ident     : /[a-zA-Z_][a-zA-Z0-9_]*/ ;                              \n"
+      " literal   : /[0-9]+(\\.[0-9]+)?((e|E)(-|\\+)?[0-9]+)?/ ;            \n"
+      "                                                                     \n"
+      " type      : (\"i1\" | /(i|u)(8|16|32|64)/ | /f(16|32|64)/) ;        \n"
+      " typeident : <type> <ident> ;                                        \n"
+      "                                                                     \n"
+      " factor    : <literal>                                               \n"
+      "           | <ident> '(' <lexp>? (',' <lexp>)* ')'                   \n"
+      "           | <ident> ;                                               \n"
+      "                                                                     \n"
+      " term      : <factor> (('*' | '/' | '%') <factor>)* ;                \n"
+      " lexp      : <term> (('+' | '-') <term>)* ;                          \n"
+      " bexp      : <lexp>                                                  \n"
+      "             ('>' | '<' | \">=\" | \"<=\" | \"!=\" | \"==\")         \n"
+      "             <lexp> ;                                                \n"
+      "                                                                     \n"
+      " stmt      : \"return\" <lexp>? ';'                                  \n"
+      "           | <ident> '(' <ident>? (',' <ident>)* ')' ';'             \n"
+      "           | <typeident> ('=' <lexp>)? ';'                           \n"
+      "           | <ident> '=' <lexp> ';'                                  \n"
+      "           | \"if\" '(' <bexp> ')' '{' <stmt>* '}' ;                 \n"
+      "                                                                     \n"
+      " args      : <typeident>? (',' <typeident>)* ;                       \n"
+      " body      : '{' <stmt>* '}' ;                                       \n"
+      " procedure : <type> <ident> '(' <args> ')' <body> ;                  \n"
+      " lang      : /^/ ((<typeident> ';') |  <procedure>)* /$/ ;           \n",
+      Ident, Number, Factor, Term, Lexp, Bexp, Stmt, Typeident, Type, Args,
+      Body, Procedure, Lang, NULL);
 
   if (err != NULL) {
     mpc_err_print(err);
@@ -118,8 +124,8 @@ int parse(const char *filename, const char *source, mpc_result_t *out_result) {
 
   const int result = mpc_parse(filename, source, Lang, out_result);
 
-  mpc_cleanup(12, Ident, Number, Factor, Term, Lexp, Stmt, Typeident, Type,
-              Args, Body, Procedure, Lang);
+  mpc_cleanup(13, Ident, Number, Factor, Term, Lexp, Bexp, Stmt, Typeident,
+              Type, Args, Body, Procedure, Lang);
 
   return result;
 }
@@ -130,11 +136,50 @@ struct MyStringCompare {
     return 0 > strcmp(lhs, rhs);
   }
 };
+
+// A map where each entry inhabits a numbered layer, this allows us to:
+// * remove entire layers with one operation
+// * alias keys as long as they do not inhabit the same layer
+template <typename T> struct NeilLayeredMap {
+private:
+  std::vector<std::map<const char *, T, MyStringCompare>> map;
+
+public:
+  NeilLayeredMap() : map(1) {}
+
+  T &operator[](const char *key) {
+    for (auto iter = map.rbegin(), iter_end = map.rend(); iter != iter_end;
+         ++iter) {
+      if (0 < iter->count(key)) {
+        return (*iter)[key];
+      }
+    }
+
+    // if we didn't find the key, we need to insert it
+    return map.rbegin()->insert(std::make_pair(key, T())).first->second;
+  }
+
+  // check whether the symbol is already defined
+  unsigned count(const char *key) const {
+    unsigned c = 0;
+    for (auto iter = map.rbegin(), iter_end = map.rend(); iter != iter_end;
+         ++iter) {
+      if (0 < iter->count(key)) {
+        c++;
+      }
+    }
+
+    return c;
+  }
+
+  void addLayer() { map.resize(map.size() + 1); }
+
+  void removeLayer() { map.resize(map.size() - 1); }
+};
 }
 
 template <typename T> using NeilVector = std::vector<T>;
-template <typename T>
-using NeilMap = std::map<const char *, T, MyStringCompare>;
+template <typename T> using NeilMap = NeilLayeredMap<T>;
 
 struct ASTLowering {
   explicit ASTLowering(const char *fileName)
@@ -391,6 +436,134 @@ struct ASTLowering {
     }
   }
 
+  LLVMValueRef lower_bexp(mpc_ast_t *const ast) {
+    AST_ASSERT(3 == ast->children_num,
+               "expected bexp AST node to have three children");
+
+    LLVMValueRef lhs = lower_ast_node(ast->children[0], nullptr);
+    LLVMValueRef rhs = lower_ast_node(ast->children[2], LLVMTypeOf(lhs));
+
+    auto operation = ast->children[1]->contents;
+
+    switch (LLVMGetTypeKind(LLVMTypeOf(rhs))) {
+    default:
+      AST_ASSERT(false, "unknown type for term AST node");
+      break;
+    case LLVMHalfTypeKind:
+    case LLVMFloatTypeKind:
+    case LLVMDoubleTypeKind: {
+      LLVMRealPredicate predicate;
+      if (0 == strcmp("<", operation)) {
+        predicate = LLVMRealOLT;
+      } else if (0 == strcmp("<=", operation)) {
+        predicate = LLVMRealOLE;
+      } else if (0 == strcmp(">", operation)) {
+        predicate = LLVMRealOGT;
+      } else if (0 == strcmp(">=", operation)) {
+        predicate = LLVMRealOGE;
+      } else if (0 == strcmp("==", operation)) {
+        predicate = LLVMRealOEQ;
+      } else if (0 == strcmp("!=", operation)) {
+        predicate = LLVMRealONE;
+      } else {
+        AST_ASSERT(false, "Unknown bexp AST node operation found");
+      }
+
+      return LLVMBuildFCmp(builder, predicate, lhs, rhs, "");
+    }
+    case LLVMIntegerTypeKind: {
+      LLVMIntPredicate predicate;
+      if (0 == strcmp("<", operation)) {
+        predicate = LLVMIntSLT;
+      } else if (0 == strcmp("<=", operation)) {
+        predicate = LLVMIntSLE;
+      } else if (0 == strcmp(">", operation)) {
+        predicate = LLVMIntSGT;
+      } else if (0 == strcmp(">=", operation)) {
+        predicate = LLVMIntSGE;
+      } else if (0 == strcmp("==", operation)) {
+        predicate = LLVMIntEQ;
+      } else if (0 == strcmp("!=", operation)) {
+        predicate = LLVMIntNE;
+      } else {
+        AST_ASSERT(false, "Unknown bexp AST node operation found");
+      }
+
+      return LLVMBuildICmp(builder, predicate, lhs, rhs, "");
+    }
+    }
+
+    return nullptr;
+  }
+
+  LLVMValueRef lower_if(mpc_ast_t *const ast) {
+    AST_ASSERT(7 <= ast->children_num,
+               "expected if AST node to have at least seven children");
+
+    AST_ASSERT_STREQ("char", ast->children[1]->tag,
+                     "expected if AST node's second child to be a character");
+    AST_ASSERT_STREQ(
+        "(", ast->children[1]->contents,
+        "expected if AST node's second child to be the character '('");
+
+    LLVMValueRef condition = lower_bexp(ast->children[2]);
+
+    AST_ASSERT_STREQ("char", ast->children[3]->tag,
+                     "expected if AST node's fourth child to be a character");
+    AST_ASSERT_STREQ(
+        ")", ast->children[3]->contents,
+        "expected if AST node's fourth child to be the character ')'");
+
+    AST_ASSERT_STREQ("char", ast->children[4]->tag,
+                     "expected if AST node's fifth child to be a character");
+    AST_ASSERT_STREQ(
+        "{", ast->children[4]->contents,
+        "expected if AST node's fifth child to be the character '{'");
+
+    AST_ASSERT_STREQ("char", ast->children[ast->children_num - 1]->tag,
+                     "expected if AST node's last child to be a character");
+    AST_ASSERT_STREQ(
+        "}", ast->children[ast->children_num - 1]->contents,
+        "expected if AST node's last child to be the character '}'");
+
+    // create the new basic block that will be the body of our if statement
+    LLVMBasicBlockRef if_true = LLVMAppendBasicBlock(function, "if_true");
+
+    // create the new basic block that will be where our if_true block converges
+    LLVMBasicBlockRef if_merge = LLVMAppendBasicBlock(function, "if_merge");
+
+    // create a branch to our new blocks
+    LLVMBuildCondBr(builder, condition, if_true, if_merge);
+
+    // and make sure all statements in the if go into our if statement
+    LLVMPositionBuilderAtEnd(builder, if_true);
+
+    // our if statement creates a new scope, so we need to add a layer to our
+    // symbol table
+    symbolTable.addLayer();
+
+    // lower the statements that make up the body of the if now
+    for (int i = 5; i < ast->children_num - 1; i++) {
+      AST_ASSERT_STREQ("stmt|>", ast->children[i]->tag,
+                       "expected if AST node to be a statement");
+
+      lower_statement(ast->children[i]);
+    }
+
+    // we are leaving the scope of our symbol table, so we need to remove the
+    // layer
+    symbolTable.removeLayer();
+
+    // we now need to reconverge our if_true basic block into the if_merge case
+    LLVMBuildBr(builder, if_merge);
+
+    // and lastly, we want all new statements after the if to go into the merge
+    // case
+    LLVMPositionBuilderAtEnd(builder, if_merge);
+
+    return 0;
+  }
+
   int lower_statement(mpc_ast_t *const ast) {
     AST_ASSERT(1 <= ast->children_num,
                "expected statement AST node to have at least one child");
@@ -426,7 +599,6 @@ struct ASTLowering {
           LLVMBuildAlloca(builder, type, typeident->children[1]->contents);
 
       symbolTable[typeident->children[1]->contents] = value;
-      symbolCleanup.push_back(typeident->children[1]->contents);
 
       // if we have more than two children, our typeident has an initializer
       if (2 < ast->children_num) {
@@ -470,6 +642,9 @@ struct ASTLowering {
           lower_ast_node(ast->children[2], LLVMGetElementType(LLVMTypeOf(lhs)));
 
       LLVMBuildStore(builder, rhs, lhs);
+    } else if ((0 == strcmp("string", ast->children[0]->tag)) &&
+               (0 == strcmp("if", ast->children[0]->contents))) {
+      lower_if(ast);
     } else {
       AST_ASSERT(false, "unknown statement AST node");
     }
@@ -478,7 +653,7 @@ struct ASTLowering {
   }
 
   int lower_function_body(mpc_ast_t *const ast) {
-    LLVMBasicBlockRef block = LLVMAppendBasicBlock(function, "");
+    LLVMBasicBlockRef block = LLVMAppendBasicBlock(function, "entry");
 
     LLVMPositionBuilderAtEnd(builder, block);
 
@@ -610,6 +785,10 @@ struct ASTLowering {
         "function symbol has the same name as an existing tracked symbol");
     symbolTable[name->contents] = function;
 
+    // we are now in the scope of the function, and have to add a layer to our
+    // symbol table
+    symbolTable.addLayer();
+
     // record that each parameter is in the symbol table too
     for (unsigned i = 0; i < numParameters; i++) {
 
@@ -617,19 +796,14 @@ struct ASTLowering {
                  "function's parameter has the same name as an existing "
                  "tracked symbol");
       symbolTable[paramNames[i]] = params[i];
-      symbolCleanup.push_back(paramNames[i]);
     }
 
     const int result = lower_function_body(body);
 
-    // remove any symbols that are local to the function. This includes
-    // parameters to the function, and identifiers declared in the body of the
-    // function.
-    for (auto symbol : symbolCleanup) {
-      symbolTable.erase(symbol);
-    }
-
-    symbolCleanup.clear();
+    // we are leaving the scope of the function, so need to remove the layer in
+    // the symbol that
+    // held the functions symbols
+    symbolTable.removeLayer();
 
     return result;
   }
@@ -662,7 +836,6 @@ private:
   LLVMValueRef function;
   NeilMap<LLVMTypeRef> typeTable;
   NeilMap<LLVMValueRef> symbolTable;
-  NeilVector<const char *> symbolCleanup;
 };
 
 int mpc2llvm(const char *filename, mpc_ast_t *ast) {
