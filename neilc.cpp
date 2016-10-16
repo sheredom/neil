@@ -62,8 +62,10 @@ bool strendEXT(const char *string, const char *suffix) {
 
 const char *src = "i32 foo(i32 x) {\n"
                   "  i32 y = x * 5;\n"
-                  "  if (y < 4) { i32 z = x; y = z; }\n"
-                  "  y = y + 42;\n"
+                  "  while (y > 13) {\n"
+                  "    if (y < 4) { i32 z = x; y = z; }\n"
+                  "    y = y + 42;\n"
+                  "  }"
                   "  return y;\n"
                   "}\n"
                   "i32 main() {\n"
@@ -107,7 +109,8 @@ int parse(const char *filename, const char *source, mpc_result_t *out_result) {
       "           | <ident> '(' <ident>? (',' <ident>)* ')' ';'             \n"
       "           | <typeident> ('=' <lexp>)? ';'                           \n"
       "           | <ident> '=' <lexp> ';'                                  \n"
-      "           | \"if\" '(' <bexp> ')' '{' <stmt>* '}' ;                 \n"
+      "           | \"if\" '(' <bexp> ')' '{' <stmt>* '}'                   \n"
+      "           | \"while\" '(' <bexp> ')' '{' <stmt>* '}' ;              \n"
       "                                                                     \n"
       " args      : <typeident>? (',' <typeident>)* ;                       \n"
       " body      : '{' <stmt>* '}' ;                                       \n"
@@ -564,6 +567,79 @@ struct ASTLowering {
     return 0;
   }
 
+  LLVMValueRef lower_while(mpc_ast_t *const ast) {
+    AST_ASSERT(7 <= ast->children_num,
+               "expected while AST node to have at least seven children");
+
+    AST_ASSERT_STREQ(
+        "char", ast->children[1]->tag,
+        "expected while AST node's second child to be a character");
+    AST_ASSERT_STREQ(
+        "(", ast->children[1]->contents,
+        "expected while AST node's second child to be the character '('");
+
+    AST_ASSERT_STREQ(
+        "char", ast->children[3]->tag,
+        "expected while AST node's fourth child to be a character");
+    AST_ASSERT_STREQ(
+        ")", ast->children[3]->contents,
+        "expected while AST node's fourth child to be the character ')'");
+
+    AST_ASSERT_STREQ("char", ast->children[4]->tag,
+                     "expected while AST node's fifth child to be a character");
+    AST_ASSERT_STREQ(
+        "{", ast->children[4]->contents,
+        "expected while AST node's fifth child to be the character '{'");
+
+    AST_ASSERT_STREQ("char", ast->children[ast->children_num - 1]->tag,
+                     "expected while AST node's last child to be a character");
+    AST_ASSERT_STREQ(
+        "}", ast->children[ast->children_num - 1]->contents,
+        "expected while AST node's last child to be the character '}'");
+
+    // create the new basic block that will be the body of our while statement
+    LLVMBasicBlockRef while_body = LLVMAppendBasicBlock(function, "while_body");
+
+    // create the new basic block that will be where our while block converges
+    LLVMBasicBlockRef while_merge =
+        LLVMAppendBasicBlock(function, "while_merge");
+
+    // create a branch to our new blocks
+    LLVMBuildCondBr(builder, lower_bexp(ast->children[2]), while_body,
+                    while_merge);
+
+    // and make sure all statements in the while go into our while statement
+    LLVMPositionBuilderAtEnd(builder, while_body);
+
+    // our while statement creates a new scope, so we need to add a layer to our
+    // symbol table
+    symbolTable.addLayer();
+
+    // lower the statements that make up the body of the while now
+    for (int i = 5; i < ast->children_num - 1; i++) {
+      AST_ASSERT_STREQ("stmt|>", ast->children[i]->tag,
+                       "expected while AST node to be a statement");
+
+      lower_statement(ast->children[i]);
+    }
+
+    // we are leaving the scope of our symbol table, so we need to remove the
+    // layer
+    symbolTable.removeLayer();
+
+    // we now need to conditionally loop back to the body of the while loop if
+    // the condition (which we are re-evaluating) is still true, otherwise we
+    // branch to the merge point
+    LLVMBuildCondBr(builder, lower_bexp(ast->children[2]), while_body,
+                    while_merge);
+
+    // and lastly, we want all new statements after the while to go into the
+    // merge case
+    LLVMPositionBuilderAtEnd(builder, while_merge);
+
+    return 0;
+  }
+
   int lower_statement(mpc_ast_t *const ast) {
     AST_ASSERT(1 <= ast->children_num,
                "expected statement AST node to have at least one child");
@@ -645,6 +721,9 @@ struct ASTLowering {
     } else if ((0 == strcmp("string", ast->children[0]->tag)) &&
                (0 == strcmp("if", ast->children[0]->contents))) {
       lower_if(ast);
+    } else if ((0 == strcmp("string", ast->children[0]->tag)) &&
+               (0 == strcmp("while", ast->children[0]->contents))) {
+      lower_while(ast);
     } else {
       AST_ASSERT(false, "unknown statement AST node");
     }
